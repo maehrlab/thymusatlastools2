@@ -1,0 +1,60 @@
+---
+title: "Loading data with thymusatlastools2"
+author: "Eric Kernfeld"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Loading data with thymusatlastools2}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+
+You can load Maehr Lab data or metadata by using functions from `thymusatlastools2`.
+
+```{r, setup}
+knitr::opts_chunk$set(results = "hide")
+```
+
+```{r}
+
+our_stuff <- thymusatlastools2::get_metadata()
+head(our_stuff[c("Sample_ID", "dge_path")])# better for static PDF of vignette
+# View(our_stuff[c("Sample_ID", "dge_path")]) # better if running interactively
+Tera_reps <- thymusatlastools2::load_maehrlab_data(c("perturb_2018JAN_hES_tera",
+                                                     "perturb_2018JAN_hDE_tera_rep1",
+                                                     "perturb_2018JAN_hDE_tera_rep2"))
+```
+
+If you check the results, you'll see that the return value is a list of sparse matrices, one per replicate.
+
+```{r}
+typeof(Tera_reps)
+length(Tera_reps)
+names (Tera_reps)
+dim   (Tera_reps[["perturb_2018JAN_hDE_tera_rep1"]])
+typeof(Tera_reps[["perturb_2018JAN_hDE_tera_rep1"]])
+```
+
+There is a utility `dge_merge_list` for merging raw data. It's fairly memory-efficient, and it handles lists of arbitrary length. 
+
+```{r}
+for(i in 1:3){
+  Tera_reps[[i]] = Tera_reps[[i]][1:100, 1:50]
+}
+all_TERA_merged <- thymusatlastools2::dge_merge_list(Tera_reps); 
+rm(Tera_reps); gc()
+typeof(all_TERA_merged)
+dim(all_TERA_merged)
+```
+
+Once you build a Seurat object, you can use `add_maehrlab_metadata` to integrate more information from the Maehr Lab metadata sheet.
+
+```{r}
+all_TERA_seurat = Seurat::CreateSeuratObject(all_TERA_merged, names.delim = "\\|", names.field = 2) 
+rm(all_TERA_merged); gc()
+all_TERA_seurat = thymusatlastools2::add_maehrlab_metadata(all_TERA_seurat, "source_tissue")
+all_TERA_seurat = thymusatlastools2::add_maehrlab_metadata(all_TERA_seurat, "species")
+table( all_TERA_seurat@meta.data[["orig.ident"]], 
+       all_TERA_seurat@meta.data[["source_tissue"]])
+```

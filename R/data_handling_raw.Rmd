@@ -1,0 +1,608 @@
+
+---
+title: "Cleaning the DGE Data"
+author: "Eric Kernfeld"
+date: "September 7, 2016"
+output: html_document
+---
+
+#### Normalization and data handling
+
+These functions help get data in and out of Seurat, or they manipulate raw data.
+
+```{r}
+
+#' Import data in 10X (v2 or v3) format. Adapted from the eponymous Seurat function.
+#'
+#' @param object Seurat object.
+#' @param data.dir Where to look.
+#' @param version Version of 10X software used.
+#'
+#' @export
+Read10X = function (data.dir = NULL, version = NULL) 
+{
+  version = ifelse(file.exists(file.path(data.dir, "features.tsv.gz")), 3, 2)
+  full.data <- list()
+  for(i in seq_along(data.dir)){
+    run <- data.dir[i]
+    if (!dir.exists(run)) {
+      stop("Directory provided does not exist")
+    }
+    if (!grepl("\\/$", run)) {
+      run <- paste(run, "/", sep = "")
+    }
+    if( version == 3 ){
+      barcode.loc <- paste0(run, "barcodes.tsv.gz")
+      gene.loc <- paste0(run, "features.tsv.gz")
+      matrix.loc <- paste0(run, "matrix.mtx.gz")
+      modifier = function(x) gzcon(file(x, open = "r"))
+    } else if (version == 2){
+      barcode.loc <- paste0(run, "barcodes.tsv")
+      gene.loc <- paste0(run, "genes.tsv")
+      matrix.loc <- paste0(run, "matrix.mtx")
+      modifier = function(x) x
+    }
+    if (!file.exists(barcode.loc)) {
+      stop("Barcode file missing")
+    }
+    if (!file.exists(gene.loc)) {
+      stop("Gene name file missing")
+    }
+    if (!file.exists(matrix.loc)) {
+      stop("Expression matrix file missing")
+    }
+    matrix.loc = modifier(matrix.loc)
+    barcode.loc = modifier(barcode.loc)
+    gene.loc = modifier(gene.loc)
+    data <- Matrix::readMM(file = matrix.loc)
+    cell.names <- readLines(barcode.loc)
+    gene.names <- readLines(gene.loc)
+    try(close(matrix.loc), silent = T)
+    try(close(barcode.loc), silent = T)
+    try(close(gene.loc), silent = T)
+    
+    if (all(grepl(pattern = "\\-1$", x = cell.names))) {
+      cell.names <- as.vector(x = as.character(x = sapply(X = cell.names, 
+                                                          FUN = ExtractField, 
+                                                          field = 1,
+                                                          delim = "-")))
+    }
+    rownames(x = data) <- make.unique(names = as.character(x = sapply(X = gene.names,
+                                                                      FUN = ExtractField, 
+                                                                      field = 2,
+                                                                      delim = "\\t")))
+    if (is.null(x = names(x = data.dir))) {
+      if (i < 2) {
+        colnames(x = data) <- cell.names
+      }
+      else {
+        colnames(x = data) <- paste0(i, "_", cell.names)
+      }
+    }
+    else {
+      colnames(x = data) <- paste0(names(x = data.dir)[i], 
+                                   "_", cell.names)
+    }
+    full.data <- append(x = full.data, values = data)
+    full.data <- do.call(cbind, full.data)
+    return(full.data)
+  }
+}
+
+#' Export data in 10X format.
+#'
+#' @param object Seurat object.
+#' @param data.dir Where to put output out to. 
+#' @param metadata.include Which columns to include from the meta.data slot. You can put anything that works in FetchData, so tSNE and PCA/ICA coordinates are OK too. These will go to an additional flat file called metadata.tsv .
+#' @param include_all If FALSE (default), include only what you see on the tSNE (formally, what's in the cell.names slot). This option exists because what you see on the tSNE is sometimes out of sync with what's in the raw.data slot: the raw.data slot doesn't get subsetted during operations such as SubsetData. 
+#' @param slot Passed to GetAssayData.
+#' @param ... Passed to GetAssayData.
+#'
+#' @export
+Write10X = function( object, 
+                     data.dir,
+                     metadata.include = colnames(object@meta.data), 
+                     slot = "raw.data", 
+                     include_all = FALSE,
+                     ... ){
+  
+  dir.create.nice(data.dir)
+  
+  # Save metadata
+  write.table( FetchData( object, metadata.include ), 
+               file.path( data.dir, paste0( "metadata.tsv" ) ), 
+               row.names = T, col.names = T, quote = F, sep = "\t" )
+  
+  # Get assay data from correct cells
+  raw_dge = GetAssayData(object, slot = slot, ... )
+  if(!include_all){
+    raw_dge = raw_dge[, object@cell.names]
+  }
+  rm(object); gc()
+  
+  # Coerce to Matrix as needed
+  if( "Matrix" != attr( class(raw_dge), "package")) {
+    warning("\nAttempting to coerce data to sparse matrix from Matrix::Matrix before export. Please check your results.\n")
+    raw_dge %<>% (Matrix::Matrix(sparse = T))
+  }
+  
+  # 10X style export
+  add_fake_ensg = function( x ) data.frame("PLACEHOLDER_FOR_ENSG" %>% paste0(seq_along(x)), x)
+  wtsv = function(X, file) write.table(X, file, sep = "\t", quote = F, row.names = F, col.names = F)
+  Matrix::writeMM(raw_dge, file = file.path(data.dir, "matrix.mtx"  ))
+  raw_dge %>% colnames   %>% wtsv(file.path(data.dir, "barcodes.tsv"))
+  raw_dge %>% rownames   %>% add_fake_ensg %>% wtsv(file.path(data.dir, "genes.tsv"   ))
+  return()
+}
+
+
+#' Rescale every cell to a certain amount of UMIs, where
+#' that amount is selected by rounding up the median UMI count up to the next power of 10.
+#'
+#' @export
+normalize_cpx_amt = function(dge, results_path = NULL, do.plot = T ){
+
+  umis_by_cell = Matrix::colSums( dge )
+  assertthat::are_equal(length(umis_by_cell), length(colnames(dge)))
+  magnitude = umis_by_cell %>% median %>% log10 %>% ceiling
+  to.return = 10^magnitude 
+  
+  # # Plot results
+  if( do.plot & !is.null(results_path) ){
+    dir.create.nice( file.path( results_path, "QC" ) )
+    pdf( file.path( results_path, "QC", "total_umis_by_cell.pdf"))
+    {
+      hist(log10(umis_by_cell), 
+           breaks = 40,
+           xlab = "log10 UMI count", main = "Number of UMIs by cell")
+      abline(v = to.return)
+    }
+    dev.off()
+  }
+  
+  return(to.return)
+}
+demo1 = matrix(2000, nrow = 5, ncol = 3)
+assertthat::are_equal(normalize_cpx_amt(demo1, results_path = NULL), 10000)
+
+
+#' Make arrays into Seurat objects.
+#' 
+#' Keeps all genes expressed in at least
+#' (by default) 3 cells and keeps all cells with at least 1000 genes. It reports some 
+#' summary figures, plotting number of genes by cell, num UMIs by cell, and number of cells by
+#' gene. 
+#' @export
+seuratify = function(raw_dge, results_path = NULL, 
+                     min.genes = 0, min.cells = 0, ... ){
+  atat(1 < raw_dge %>% dim %>% min %>% min)
+  seurat_dge = 
+    CreateSeuratObject(  raw.data = raw_dge ,
+                         min.cells = min.cells,
+                         min.genes = min.genes, 
+                         names.delim = "\\|",
+                         names.field = 2, ... )
+  print("Raw dimensions:")
+  print(dim(raw_dge))
+  print("Final dimensions:")
+  print(dim(seurat_dge@raw.data))
+  rm(raw_dge); gc()
+  seurat_dge@raw.data %<>% (Matrix::Matrix)
+
+  # Normalize and convert to log2 instead of natural log
+  seurat_dge %<>% NormalizeData()
+  seurat_dge@data = seurat_dge@data / log(2)
+
+  # # Make sure the raw data is just UMI counts and update the nUMI field, which will be
+  # # filled incorrectly given the above
+  seurat_dge %<>% AddMetaData( col.name = "nUMI", 
+                               metadata = setNames( Matrix::colSums(  seurat_dge@raw.data ),
+                                                    colnames(         seurat_dge@raw.data ) ) )
+  
+  # # Plot results
+  if( !is.null( results_path ) ){
+    dir.create.nice( file.path(results_path, "QC" ) )
+    genes_by_cell = Matrix::colSums( seurat_dge@raw.data>0 )
+    {
+      pdf(file.path(results_path, "QC", "total_genes_by_cell.pdf"))
+      hist(log10(genes_by_cell), breaks = 40,
+           xlab = "log10 gene count", main = "Number of genes by cell")
+      abline(v = log10( min.genes ) )
+      dev.off()
+    }
+    
+    cells_by_gene = Matrix::rowSums( seurat_dge@raw.data > 0 )
+    {
+      pdf(file.path(results_path, "QC", "total_cells_by_gene.pdf"))
+      hist(log10(cells_by_gene), breaks = 40,
+           xlab = "log10 cell count", main = "Number of cells by gene")
+      abline(v = log10( min.cells ) )
+      dev.off()
+    }
+    
+
+  }
+
+  return(seurat_dge)
+}
+
+#' Alias for seuratify, for backwards compatibility. 
+#' 
+#' 
+#' @export
+seuratify_thy_data = seuratify
+
+#' Extract mostly-raw (medium rare?) data from a Seurat object.
+#' 
+#' Seurat preserves the raw data exactly. Sometimes that's not ideal.
+#' This function helps you get rawish data that have undergone the same QC filters as the Seurat scale.data,
+#' so some cells and genes are filtered out. 
+#' But, the numbers are UMI counts, integers, not logged or with any of that normalization BS.
+#' This function guarantees output with `colnames(output) == dge@cell.names`.
+#' 
+#' Because the `@raw.data` slot was filled in wrong in some of my Seurat objects,
+#' this can use `load_thymus_profiling_data` to get the raw data.
+#' To toggle this behavior, set `retrieve_anew = {T,F}`.
+#' @export
+deseuratify_raw_data = function( seurat_dge, retrieve_anew = F ){
+  if( !retrieve_anew ){
+    raw_dge = seurat_dge@raw.data
+  } else {
+    raw_dge = load_maehrlab_data( sample_ids = unique( FetchData(seurat_dge, "orig.ident" )[[1]]) ) %>% dge_merge_list
+  }
+  desired_genes = rownames( seurat_dge@data )
+  acceptable_genes = intersect( desired_genes, rownames( raw_dge ) )
+  missing_genes    = setdiff(   desired_genes, rownames( raw_dge ) )
+  raw_dge = raw_dge[acceptable_genes, seurat_dge@cell.names]
+  
+  ##Zero-pad to ensure all genes from either @data slot are present
+  my_zeroes = Matrix::Matrix( 0, ncol = ncol( raw_dge ), nrow = length( missing_genes ), sparse = T )
+  rownames( my_zeroes ) = missing_genes
+  colnames( my_zeroes ) = colnames( raw_dge )
+  raw_dge = rbind( raw_dge, my_zeroes )
+  raw_dge = raw_dge[desired_genes, ]
+  
+  atae(raw_dge, round( raw_dge ) )
+  atae(desired_genes, rownames( raw_dge ) )
+  return( raw_dge )
+}
+
+
+```
+
+#### Merging raw data
+
+This function merges matrices with sensible defaults for digital gene expression data.
+
+```{r}
+#' Merge a list of digital gene expression matrices.
+#'
+#' @param dge_list list of matrices with genes as rows and cell barcodes as columns. 
+#' @param allow_barcode_overlap Set this to TRUE if matching barcodes in different inputs refer to the same cells, 
+#' as in a resequencing of a library. Set this to FALSE (default) if matching barcodes would only occur by coincidence, 
+#' as in merging of different replicates for joint analysis.
+#' @details `dge_merge_list` converts the digital gene expression matrices to dataframes with genes as columns, merges them, then converts the result back, all without disturbing the gene labels. A gene will be included if it appears in any of the datasets. If a gene appears in one dataset but not another, zeroes will be filled in for missing expression levels.
+#' @export
+dge_merge_list = function(dge_list, allow_barcode_overlap = F){
+  # Allow duplicate cells but not duplicate genes
+  all_genes = Reduce( f = union, x = lapply( dge_list, rownames ) )
+  all_cells = Reduce( f = c,     x = lapply( dge_list, colnames ) )
+  input_dimensions = Reduce(rbind, lapply(dge_list, dim)) %>% matrix(ncol = 2)
+
+  if( allow_barcode_overlap ){
+    all_cells = unique( all_cells )
+  } else {
+    if(anyDuplicated(all_cells)){ 
+      warning( "These samples contain overlapping barcodes! 
+                \nAttempting to append names(dge_list) to barcodes..." )
+      if(is.null(names(dge_list))){ 
+        stop("...No names available for dge_list!")
+      }
+      all_cells = lapply( dge_list, colnames ) %>% 
+        mapply( paste0, .,  "|", names(dge_list) ) %>%
+        Reduce( f = c,     x = . )
+    }
+    atat(!anyDuplicated(all_cells)) 
+  }
+  
+  new_dge = Matrix::Matrix( 0, 
+                            nrow = length( all_genes ), 
+                            ncol = length( all_cells ), 
+                            sparse = T ) 
+  rownames( new_dge ) = all_genes
+  colnames( new_dge ) = all_cells
+  for( ii in seq_along( dge_list ) ){
+    rr = rownames(dge_list[[ii]])
+    cc = colnames(dge_list[[ii]])
+    new_dge[rr, cc] = new_dge[rr, cc] + dge_list[[ii]]
+    print( paste( "Finished merging dge matrix", names(dge_list)[[ii]] ) )
+    dge_list[[ii]] = matrix(); gc()
+  }
+  #Results should have at least as many genes (barcodes) as the input with the most genes (barcodes) 
+  assertthat::assert_that(dim(new_dge)[1] >= max(input_dimensions[,1]))
+  assertthat::assert_that(dim(new_dge)[2] >= max(input_dimensions[,2]))
+  #If no barcode overlap, should retain all input barcodes.
+  if( !allow_barcode_overlap ){
+    assertthat::assert_that(dim(new_dge)[2] == sum(input_dimensions[,2]))
+  }
+  assertthat::assert_that(!is.null(colnames(new_dge)))
+  assertthat::assert_that(!is.null(rownames(new_dge)))
+  return( new_dge )
+}
+
+```
+
+#### Retrieving our data
+
+These functions help find and access Maehrlab data.
+
+```{r}
+
+#' Given a Seurat object, add information about our experiments.
+#'
+#' @details It looks in `get_metadata()` for a column named `variable_to_add` and adds 
+#' that variable to @meta.data with the 
+#' name `new_name` (default is `variable_to_add`).
+#' It finds the right cells by matching "Sample_ID" to "orig.ident".
+#' 
+#' @export
+#'
+add_maehrlab_metadata = function( dge, variable_to_add, new_name = NULL, NA_strings = c("NA", ""),
+                                  maehrlab_metadata = get_metadata() ){
+  
+  if( !all(levels( dge@meta.data$orig.ident ) %in% maehrlab_metadata[["Sample_ID"]] ) ){
+    cat( levels( dge@meta.data$orig.ident ) %>% setdiff( maehrlab_metadata[["Sample_ID"]] ) )
+    stop( "Some sample id's not recognized. Look at unique(get_metadata()[['Sample_ID']]) to see what's available." )
+  } 
+  if( !variable_to_add %in% names( maehrlab_metadata ) ){
+    stop( "Some variables not recognized. Look at colnames(get_metadata()) to see what's available." )
+  }
+  
+  data_by_sample = maehrlab_metadata[[variable_to_add]]
+  data_by_sample[ data_by_sample %in% NA_strings ] = NA
+  names( data_by_sample ) = maehrlab_metadata[["Sample_ID"]]
+  
+  # # Expand it to go cell by cell instead of sample by sample; add it to the Seurat object
+  new_temp = data_by_sample[ as.character( dge@meta.data$orig.ident ) ]
+  names( new_temp ) = rownames( dge@meta.data )
+  if( is.null( new_name ) ){ new_name = variable_to_add }
+  dge = Seurat::AddMetaData( dge, metadata = new_temp, col.name = new_name )
+  return( dge )
+}
+
+```
+
+TCR merging
+
+```{r}
+
+#' Add T-cell receptor expression from a separate alignment process. 
+#'
+#' @param dge Seurat object
+#' @param metadata Sample sheet containing a field "Sample_ID" (to be matched with "orig.ident" from dge) 
+#' and another called "tcr_dge_path" (to look for TCR-containing DGEs).
+#' 
+#' @export
+#'
+add_tcr = function( dge, metadata = get_metadata() ){
+  
+  # Filter metadata down to essentials
+  samples_needed = levels(FetchData(dge, "orig.ident")[[1]])
+  metadata = subset( metadata, Sample_ID %in% samples_needed, 
+                     select = c("Sample_ID", "tcr_dge_path"), drop = F)
+  tcr_paths = subset(metadata, file.exists( tcr_dge_path ) )
+  
+  # Deal with samples for which no TCR realignment was performed
+  unavailable = subset(metadata, !file.exists( tcr_dge_path ), select = "Sample_ID", drop = T )
+  if( length(unavailable) > 0 ){
+    warning(paste0(c("TCR alignments unavailable for these samples:", unavailable ), collapse = "\n"))
+  }
+  
+  # Read in TCR expression
+  tcr_matrices = lapply(tcr_paths$tcr_dge_path, read.table, header = T, row.names = 1)
+
+  # Filter out cells not present in dge, handling situations with no matches
+  for( i in seq_along( tcr_matrices ) ){
+    # Append correct sample ID to barcodes, asserting that it's not there yet
+    # I used the pipe as a separator. Probably a naïve choice but I'm stuck now.
+    atae( 0, length(grep("\\|", colnames(tcr_matrices[[i]]) ) ) )
+    colnames(tcr_matrices[[i]]) %<>% paste0("|", tcr_paths$Sample_ID[[i]] )
+    tcr_cells = tcr_matrices[[i]] %>% colnames %>% intersect(dge@cell.names)
+    if (length(tcr_cells)==0){
+      tcr_matrices[[i]] = "NO_MATCH"
+    } else {
+      tcr_matrices[[i]] %<>% extract(, tcr_cells)
+    }
+  }
+  tcr_matrices %<>% Filter(f = function(x) {!identical(x, "NO_MATCH")})
+  
+  # Get list of TCR genes
+  all_tcr_genes = thymusatlastools:::ALL_TCR_GENES
+  atat(!is.null(all_tcr_genes))
+  
+  # Filter out non-TCR genes
+  for( i in seq_along( tcr_matrices ) ){
+    tcr_genes_present = tcr_matrices[[i]] %>% rownames %>% intersect(all_tcr_genes)
+    if (length(tcr_genes_present)==0){
+      tcr_matrices[[i]] = "NO_MATCH"
+    } else {
+      tcr_matrices[[i]] %<>% extract(tcr_genes_present, )
+    }
+  }
+  tcr_matrices %<>% Filter(f = function(x) {!identical(x, "NO_MATCH")})
+    
+  # Remove any cells lurking in the raw data that were excluded downstream.
+  dge@raw.data = deseuratify_raw_data(dge) 
+  
+  # Merge into Seurat object @raw.data, but keep the old UMI counts to preserve the normalization.
+  normalization_totals = dge@raw.data %>% colSums
+  for( i in seq_along( tcr_matrices ) ){
+    # Overwrite existing UMIs to avoid double-counting.
+    dge@raw.data[intersect(rownames(dge@raw.data), all_tcr_genes), ] = 0
+    dge@raw.data = dge_merge_list(list(dge = dge@raw.data,
+                                       tcr_i = tcr_matrices[[i]]),
+                                  allow_barcode_overlap = TRUE )
+  }
+  dge@raw.data %<>% as.matrix
+
+  # Merge into Seurat object @data.
+  old_lognorm = dge@data 
+  dge@data = log2( 1 + 1e4*sweep( dge@raw.data, MARGIN = 2, STATS = normalization_totals, FUN = "/" ) ) 
+  non_tcr_genes = dge@data %>% rownames %>% setdiff(all_tcr_genes)
+  if( !all( dge@data[non_tcr_genes,] == old_lognorm[non_tcr_genes,] ) ){
+    warning(paste0("Normalized data does not quite match raw data. \n",
+                   "Renormalizing TCR counts with current cellwise UMI counts.\n",
+                   "Leaving non-TCR normalized data untouched.\n"))
+    dge@data[non_tcr_genes,] = old_lognorm[non_tcr_genes,] %>% as.matrix
+  }
+  
+  # Add total TCR A, B, D, and G expression to metadata
+  for( pattern in paste0("TR", c("A", "B", "D", "G"))){
+    gene_segments = all_tcr_genes[grep(pattern, all_tcr_genes, ignore.case = TRUE)]
+    dge %<>% AddMetaData( FetchDataZeroPad(dge, gene_segments) %>% rowSums, col.name = paste0(pattern, "_TOTAL"))
+  }
+  
+  return( dge )
+}
+
+```
+
+
+Data loading 
+
+```{r}
+#' Load digital gene expression matrices from Maehrlab dropbox.
+#'
+#' @param sample_ids Sample IDs to include.
+#' @param test_mode If true, return teensy little datasets with 50 cells and 200 genes. 
+#' @param lincRNA Deprecated.
+#' @param convert_all_to_mouse Deprecated.
+#' @details There is one array for every sample ID you pass in. Each array has one column per gene and one row per cell. 
+#' The column names are sample id's concatenated onto cell barcodes, separated by the infix `"|"`. 
+#' This allows sample ID's to contain underscores without confusing Seurat when it goes to fetch the sample ID for `orig.ident`. 
+#' @export
+#'
+load_maehrlab_data = function( sample_ids = "all", 
+                               test_mode = F, 
+                               lincRNA = F ){
+  # # Subset metadata down to just the desired samples
+  metadata = get_metadata()
+  missing = setdiff( sample_ids, metadata$Sample_ID )
+  if(length(missing) > 0){
+      warning( "\n There are no records of these sample IDs: \n"); cat( missing ); cat("\n")
+  }
+  
+  # Keep only samples in both, preserving order of arguments. 
+  sample_ids = sample_ids[sample_ids %in% metadata$Sample_ID]
+  rownames(metadata) = metadata$Sample_ID
+  metadata = metadata[sample_ids, ]
+  
+  # # Check dge file availability 
+  file_type_header = ifelse( lincRNA, "lincRNA_dge_path", "dge_path_rel" )	
+  if( lincRNA ){
+    metadata[["readpath"]] = metadata[[ "lincRNA_dge_path" ]]
+  } else {
+    metadata[["readpath"]] = file.path( dirname(get_metadata_path()), metadata[[ "dge_path_rel" ]] )
+  }
+  available = file.exists( metadata[["readpath"]] ) & ( grepl("^Y|^y|^T|^t", metadata[["files_available"]] ) )
+  sample_ids = as.character( metadata[["Sample_ID"]] )
+  unavailable_samples_str = paste0( sample_ids[!available], collapse = "\n" )
+  available_samples_str   = paste0( sample_ids[ available], collapse = "\n" )
+  if(!all(available)){
+    warning( paste0( "\n Files unavailable for these samples: \n", unavailable_samples_str, "\n" ) )
+  }
+  metadata = metadata[ available, ]
+  runs_to_return = as.list( metadata[["Sample_ID"]] )
+  names( runs_to_return ) = runs_to_return
+  # # Fetch data
+  for( i in seq_along( runs_to_return ) ){
+    print( paste( "Loading dataset", metadata[i, "Sample_ID"] ) )
+    readpath = metadata[i, "readpath"]
+    # Adapt to whichever pipeline created the data
+    reddit = F
+    if ( metadata[i, "pipeline"] %in% c("10X", "10Xv3", "cellranger", "cellranger_v3", "umitools", "umi_tools" ) ){
+      dge = thymusatlastools2::Read10X( data.dir = readpath )
+      reddit = T
+    } 
+    if( metadata[i, "pipeline"] == "dropseq" ){
+      dge = read.table( file = readpath, sep="\t", header=TRUE, row.names=1 )
+      reddit = T
+    } 
+    if( metadata[i, "pipeline"] == "CITE-seq Count" ){
+      dge = read.table( file = readpath, sep=",", header=TRUE, row.names=1 )
+      reddit = T
+    } 
+    # In case pipeline creating data is not known
+    if ( !reddit ) {
+      warning(paste0("For sample ",
+                     metadata[i, "Sample_ID"], 
+                     " , unrecognized entry in pipeline field:\n", 
+                     metadata[i, "pipeline"], "\n",
+                     "I'll do my best, but check the results.\n"))
+      dge = matrix()
+      if( file.info( readpath )$isdir ){
+        cat("Reading \n", readpath, "\n as 10X.\n")
+        dge = try( thymusatlastools2::Read10X( data.dir = readpath ) )
+      } else {
+        cat("Reading \n", readpath, "\n as dropseq.\n")
+        dge = try( read.table( file = readpath, sep="\t", header=TRUE, row.names=1 ) )
+      }
+    }
+    # Append sample ID to barcodes
+    colnames( dge ) = paste( colnames( dge ), metadata[i, "Sample_ID"], sep = "|" )
+    
+    # Downsample if in test mode
+    if( test_mode ){
+      genes_included = c( rownames( dge )[1001:1200] )
+      dge = dge[genes_included, 1:50]
+    }
+    # Ensure format is predictable -- and sparse
+    if(is.data.frame(dge)){dge %<>% as.matrix}
+    runs_to_return[[i]] = Matrix::Matrix(dge, sparse = T)
+    rm(dge)
+  }
+  assertthat::are_equal( length( runs_to_return ), length( sample_ids) ) 
+  return( runs_to_return )
+}
+
+#' Alias for load_maehrlab_data 
+#'
+#' @export
+#'
+load_thymus_profiling_data = load_maehrlab_data
+
+#' Alias for load_maehrlab_data 
+#'
+#' @export
+get_maehrlab_data = load_maehrlab_data
+
+
+
+#' Get path to thymus atlas sample metadata (and data).
+#' 
+#' @export
+#'
+get_metadata_path = function(){
+  suffix = file.path("shared_Bioinformatics", "all_sequencing_metadata", "scRNA.csv")
+  PATH_TO_METADATA_PRIVATE = file.path( "~", "Dropbox",  suffix                     )
+  PATH_TO_METADATA_UMASS = file.path( "~", "Dropbox (UMass Medical School)", suffix )
+  PATH_TO_METADATA_PRIVATE %<>% path.expand
+  PATH_TO_METADATA_UMASS %<>% path.expand
+  if( file.exists( PATH_TO_METADATA_PRIVATE ) ){
+    return(PATH_TO_METADATA_PRIVATE)
+  } else if( file.exists( PATH_TO_METADATA_UMASS ) ){
+    return(PATH_TO_METADATA_UMASS)
+  } else {
+    stop("Please define a function get_metadata_path() that returns a length-1 character vector containing the path to the folder containing the metadata.\n")
+  }
+}
+
+#' Get thymus atlas sample metadata.
+#' 
+#' @export
+#'
+get_metadata = function() {
+  read.csv( file.path(get_metadata_path()), stringsAsFactors = F )
+}
+```
+

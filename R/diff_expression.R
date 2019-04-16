@@ -1,0 +1,211 @@
+## ------------------------------------------------------------------------
+
+#' Quickly compute summary statistics for all genes.
+#'
+#' @param dge Seurat object
+#' @param ident.use Any factor variable available via FetchData(dge). 
+#' @param aggregator Function used to aggregate within clusters. Try mean or prop_nz.
+#' @param genes_per_cluster Limit on number of genes returned per cluster.
+#'
+#' @export
+#'
+#'
+DESummaryFast = function( dge, ident.use = "ident", aggregator = mean, genes_per_cluster = NULL, next_cluster = 2 ){
+  cat("Aggregating...\n")
+  cluster_means = aggregate_nice( t(as.matrix(dge@data)), by = Seurat::FetchData(dge, ident.use), FUN = aggregator ) 
+  cat("Done.\n")
+  nwm = function(x)(names(which.max(x)))
+  cluster = apply( cluster_means, 2, nwm ) 
+  max_pairwise_diff = apply( cluster_means, 2, max ) - apply( cluster_means, 2, min )
+  rest_mean = function(x) mean(sort(x, decreasing = T)[-1])
+  avg_diff = apply( cluster_means, 2, max ) - apply( cluster_means, 2, rest_mean )
+  big_list = data.frame( cluster = cluster, 
+                          avg_diff = avg_diff, 
+                          max_pairwise_diff = max_pairwise_diff, 
+                          gene = colnames( cluster_means ) ) 
+  big_list = big_list[order(big_list$cluster, -big_list$avg_diff), ]
+  if( !is.null( genes_per_cluster ) ){
+    small_list = c()
+    for( cluster in unique( big_list$cluster )){
+      this_cluster_info = big_list[big_list$cluster==cluster, ]
+      this_cluster_info = this_cluster_info[1:genes_per_cluster, ]
+      small_list = rbind(small_list, this_cluster_info)
+    }
+    return( small_list )
+  } else {
+    return( big_list )
+  }
+}
+
+#' Find genes highly specific to a single cluster by comparing to the next-highest (or third-highest, or r-th highest) cluster.
+#'
+#'
+#' @param dge 
+#' @param ident.use A categorical variable obtainable via FetchData. Clusters to find markers for.
+#' @param n How many genes to return for each cluster.
+#' @param r Each cluster is compared to the second highest cluster if r=2, third if r=3, et cetera. The default is r=2, but if you have (for example) two FOXN1+ clusters near the tip of a differentiation trajectory, you could set it a little higher to still rank FOXN1 highly.
+#' @param AGG_FUN Given a numeric vector x of cell values for one cluster, 
+#' aggregate them into a value to be used for ranking clusters. Defaults to proportion of nonzeroes.
+#' @param genes.use Genes to start from.
+#'
+#' For each gene, rank clusters (e.g. by proportion of cells expressing that gene). 
+#' Find the peak cluster. 
+#' Then subtract the second (rth) cluster's expression from the peak cluster expression. 
+#' In each cluster, take all genes peaking in that cluster, rank them by the result of the 
+#' previous calculation, and return the top n.
+#'
+#' @export
+#'
+FindHighlySpecific = function( dge, ident.use = "ident", 
+                               n = 10,
+                               r = 2,
+                               AGG_FUN = prop_nz,
+                               genes.use = dge@data %>% rownames ){
+  genes.use %<>% intersect(AvailableData(dge))
+  assertthat::assert_that(length(genes.use)>0)
+  ident_df = FetchData(dge, ident.use)
+  gene_df = FetchData(dge, genes.use)
+  assertthat::assert_that(is.data.frame(ident_df))
+  ident_df[[ident.use]] %<>% as.character
+  
+  cluster_summaries = aggregate_nice( gene_df, ident_df[[ident.use]], FUN = AGG_FUN ) %>% t
+  cluster_labels = colnames(cluster_summaries)
+  
+  second       = function(x) sort (x, decreasing = T) %>% extract2(r)
+  which.second = function(x) order(x, decreasing = T) %>% extract2(r)
+  X = data.frame(
+    gene = rownames(cluster_summaries),
+    highest_label = apply(cluster_summaries, 1, which.max)    %>% extract(cluster_labels, . ), 
+    second_label  = apply(cluster_summaries, 1, which.second) %>% extract(cluster_labels, . ), 
+    highest_value = apply(cluster_summaries, 1, max), 
+    second_value  = apply(cluster_summaries, 1, second )
+  )
+  X$rank_var = X$highest_value - X$second_value
+  X_as_list = lapply( cluster_labels, function( s ) dplyr::top_n( subset(X, highest_label==s), rank_var, n = n ) ) 
+  names(X_as_list) = cluster_labels
+  return( X_as_list %>% Reduce(f = rbind) )
+}
+
+FindClusterSpecific = FindHighlySpecific
+
+#' Test for markers flexibly from a Seurat object.
+#'
+#' Convenience wrapper for Seurat::FindMarkers.
+#'
+#' @param ident.use Fetched via FetchData to define the groups being tested. 
+#' @param ident.1 @param ident.2 Levels of ident.use to compare. Character vectors expected. These may have length > 1. 
+#' @param order_by_var Column to sort the results by.
+#' @param genes.use @param ... Passed into FindMarkers. genes.use is filtered to exclude unavailable genes.
+#'
+#' @export
+#'
+FindMarkersFlex = function( object,
+                            genes.use,
+                            ident.use, 
+                            ident.1, 
+                            ident.2 = object %>% FetchData(ident.use) %>% extract2(1) %>% unique %>% setdiff(ident.1),
+                            order_by_var = "avg_logFC",
+                            ... ){
+  # This chunk handles ident.1 or .2 of length greater than 1 by collapsing them both with underscores.
+  new_ident = FetchData( object, ident.use )[[1]] %>% as.character
+  names(new_ident) = names(object@ident)
+  new_ident[new_ident %in% ident.1] = paste0(ident.1, collapse = "_")
+  new_ident[new_ident %in% ident.2] = paste0(ident.2, collapse = "_")
+  ident.1 = paste0(ident.1, collapse = "_")
+  ident.2 = paste0(ident.2, collapse = "_")
+  object %<>% Seurat::SetIdent(ident.use = new_ident, cells.use = names(new_ident))
+  # Slice the object down to just the relevant cells, to save time and reduce code complexity downstream.
+  object %<>% SubsetData(ident.use = c(ident.1, ident.2))
+  assertthat::assert_that( ident.1 %in% object@ident )
+  assertthat::assert_that( ident.2 %in% object@ident )
+  # Call Seurat
+  genes.use %<>% intersect(rownames(object@data))
+  x = Seurat::FindMarkers( object, ident.1 = ident.1, ident.2 = ident.2, genes.use = genes.use, ... )
+  # Reorder output
+  x = x[order(x[[order_by_var]], decreasing = T), ]
+  x$gene = rownames(x)
+  x$q_val = x$p_val %>% p.adjust(method = "fdr", n = nrow(object@data))
+  return( x )
+}
+
+
+
+
+
+#' Stratify cells using a classifier, then test for effects of a treatment within each cell type. 
+#'
+#' @param dge_test Test set for classifier. Seurat object.
+#' @param dge_train Training set for classifier. Seurat object.
+#' @param ident.use Metadata field to use as classifier output.
+#' @param treatment_var Metadata field to use as diff. expression labels.
+#' @param treatment_1 @param treatment_2 Levels of \code{ treatment_var } to contrast.
+#' @param ... Extra args passed to DiffExpByType
+#' 
+#' @export
+#'
+DiffExpAfterClassifier = function( dge_test, 
+                                   dge_train, 
+                                   ident.use,
+                                   treatment_var,
+                                   treatment_1, 
+                                   treatment_2, ... ){
+  # Classify
+  dge_test = knn_classifier( dge_train = dge_train, 
+                             dge_test = dge_test, 
+                             ident.use = ident.use )
+  
+  
+  # Differential expression by type
+  DiffExpByType( dge = dge_test,
+                 treatment_var = treatment_var,
+                 treatment_1 = treatment_1, 
+                 treatment_2 = treatment_2 )
+}
+
+#' Test for effects of a treatment within cell types. 
+#'
+#' @param dge Seurat object
+#' @param treatment_var Passed to FetchData.
+#' @param treatment_1 @param treatment_2 Levels of treatment to compare.
+#' @param cell_type_var Passed to FetchData.
+#'
+#' @export
+#'
+DiffExpByType = function( dge,
+                          treatment_var,
+                          treatment_1, 
+                          treatment_2,
+                          cell_type_var = "classifier_ident",
+                          ... ){
+  
+  # This is a workaround for an error that appears in SubsetDataFlex when the result has only one cell.
+  # I should fix it, but that would be useless for differential expression testing anyways.
+  ct_counts = FetchData(dge, cell_type_var)[[1]] %>% table
+  if( any( ct_counts < 2 ) ){
+    # You see the cat during execution. Meow. The warning appears only afterwards.
+    cat(     "You won't test some cell types because there are too few cells.\n")
+    warning( "Didn't test some cell types because there are too few cells.\n")
+  }
+  ct_counts = ct_counts[ct_counts>=2]
+  ct_levels = names(ct_counts)
+
+  de_gene_tables = as.list(ct_levels)
+  names(de_gene_tables) = ct_levels
+  for( ct in ct_levels ){
+    dge_ct = SubsetDataFlex( dge,
+                             vars.use = cell_type_var, 
+                             predicate = paste0( cell_type_var, "==", "'", ct, "'" ) )
+
+    de_gene_tables[[ct]] = tryCatch(FindMarkersFlex( dge_ct,
+                                                     ident.use = treatment_var, 
+                                                     ident.1 = treatment_1, 
+                                                     ident.2 = treatment_2, ... ) ,
+                                    error = function(e) return(NULL))
+    rm(dge_ct)
+  }
+  return( de_gene_tables )
+}
+
+
+
+

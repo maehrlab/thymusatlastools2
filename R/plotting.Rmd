@@ -1,0 +1,804 @@
+
+---
+title: "Cleaning the DGE Data"
+author: "Eric Kernfeld"
+date: "September 7, 2016"
+output: html_document
+---
+
+####Data exploration: differential expression and plotting
+
+```{r}
+#' Return spline-smoothed expression plots over pseudotime.
+#'
+#' @export
+time_series = function( dge, gene, colour = "eday", main = NULL, x = "pseudotime", col = Thanksgiving_colors, add_points = T ){
+  atae( length( gene ), 1 )
+  if( is.null(main)){ main = paste0( "Expression by ", x)}
+    
+  # Sanitize input -- `aes_string` chokes on a genes with hyphens (Nkx2-1)
+  rownames( dge@data ) = make.names( rownames( dge@data ) )
+  rownames( dge@raw.data ) = make.names( rownames( dge@raw.data ) )
+  rownames( dge@scale.data ) = make.names( rownames( dge@scale.data ) )
+  gene = make.names( gene )
+  
+  
+  my_df = FetchDataZeroPad( dge, vars.all = c( x, gene, colour ) ) 
+  my_df = my_df[order(my_df[[x]]), ]
+  atat( all( sapply( my_df, FUN = is.numeric)))
+  s = mgcv:::s
+  my_df$smoothed_vals = mgcv::gam( family = mgcv::nb(), 
+                                   formula = as.formula(paste0( gene, " ~ s(", x, ")" )),
+                                   data = my_df ) %>% predict(type = "response")
+  p = ggplot( my_df ) + ggtitle( main ) + 
+    geom_smooth( aes_string( x=x, y=gene ), 
+                 formula = y ~ s(x),
+                 colour = "black",
+                 method = mgcv::gam, 
+                 method.args = list( family = mgcv::nb() )) 
+  if( add_points ){
+    p = p + geom_point( aes_string( x=x, y=gene, colour = colour ) ) 
+  } 
+  p = p + coord_cartesian(ylim=c(0,2*max(my_df$smoothed_vals) + 0.01)) 
+  p = p + scale_y_continuous(labels = function(x) sprintf("%4.1f", x) )
+  p = p + ggtitle( gene )
+  if( !is.null( col ) ){ p = p + scale_color_gradientn( colours = col ) }
+  return( p )
+}
+
+#' Save plots from `times_series`.
+#'
+#' @param types For an explanation of the "types" param, see ?tnse_colored .
+#' 
+#' @export
+time_series_save = function( dge, 
+                             results_path, 
+                             gene,
+                             x = "pseudotime",
+                             types = c("pdf", "pdf_no_leg"), 
+                             width = 8,
+                             height = 6,
+                             colour = "eday",
+                             ... ){
+  types = tolower(types)
+  # Sanitize input -- `aes_string` chokes on a genes with hyphens (Nkx2-1)
+  rownames( dge@data ) = make.names( rownames( dge@data ) )
+  rownames( dge@raw.data ) = make.names( rownames( dge@raw.data ) )
+  rownames( dge@scale.data ) = make.names( rownames( dge@scale.data ) )
+  gene = make.names( gene )
+  
+  
+  p = time_series( dge, gene, colour = colour, x = x, ... )
+  results_path = file.path( results_path, "time_series" )
+  dir.create.nice( results_path )
+  if( "pdf" %in% types ){
+    ggsave( filename = file.path( results_path, paste0( gene, ".pdf") ),
+          plot = p,
+          width = width, height = height)
+  } 
+  if( any( c("pdf_noleg", "pdf_no_leg") %in% types ) ){
+    ggsave( filename = file.path( results_path, paste0( gene, "_no_leg.pdf") ),
+            plot = p + theme(legend.position="none"),
+            width = width, height = height)
+  }
+  if( any( c( "png_pdf_split", "pdf_png_split" ) %in% types ) ){
+    # PNG no axis tick labels, no axis labels, and no legend
+    ggsave( filename = file.path( results_path, paste0( gene, ".png") ),
+            plot = p + 
+              theme(legend.position="none") +
+              theme(axis.text.x  = element_blank(), 
+                    axis.text.y  = element_blank()) + 
+              xlab("") + ylab("") + ggtitle(""),
+            width = width, height = height)
+    
+    # ==== PDF with no points ====
+    # Copy plot and remove points
+    p_no_pts = p
+    p_no_pts$layers = p_no_pts$layers[1]
+    # Add four points to get the right y axis and color legend
+    p1 = which.max( FetchDataZeroPad( dge, gene )[[1]] )[1]
+    p2 = which.min( FetchDataZeroPad( dge, gene )[[1]] )[1]
+    p3 = which.max( FetchDataZeroPad( dge, colour )[[1]] )[1]
+    p4 = which.min( FetchDataZeroPad( dge, colour )[[1]] )[1]
+    p_no_pts = p_no_pts + geom_point( data = FetchDataZeroPad( dge, c( x, colour, gene ) )[c( p1, p2, p3, p4 ) , , drop = F],
+                                      aes_string( x = x, y = gene, colour = colour ) )
+    ggsave( filename = file.path( results_path, paste0( gene, "_few_pts.pdf") ),
+            plot = p_no_pts ,
+            width = width, height = height)
+  } 
+  if( "pdf_no_cells" %in% types ){
+    p_no_pts = p
+    p_no_pts$layers = p_no_pts$layers[1]
+    ggsave( filename = file.path( results_path, paste0( gene, "_no_pts.pdf") ),
+            plot = p_no_pts ,
+            width = width, height = height)
+  }
+}
+
+#' Make tSNE plots (or PCA, or Monocle; it's customizable)
+#' 
+#' @param dge Seurat object
+#' @param colour Variable to fetch and plot. Length-1 character. If omitted, a dark grey plot is returned.
+#' @param subset_id Vector of subsets to include on the plot. Cells not included will still be included via
+#' geom_blank so as to preserve the scale of the plot.
+#' @param axes Variables to fetch for use on X and Y axes. Defaults to tSNE embedding.
+#' @param fix_coords Force the plot to be square? Defaults to T, because a rotated or reflected version of 
+#' the tSNE embedding should convey the exact same relationships. 
+#' @param alpha Transparency. Number between 0 and 1. size.use
+#' @param size.use Point size. If NULL, uses sensible defaults.
+#' @param cols.use Colorscale. Character vector, hexadecimal or e.g. c("khaki1", "red"). 
+#' For discrete data fetched for "colour", should be named with the variable's levels.
+#' @param use_rank Transform expression level to ranks before plotting?
+#' @param overplot_adjust Deprecated. Use mode arg instead.
+#' @param mode Different styles of plot. Should be one of \code{c("regular", "points", "overplot_adjust", "umi_density", "umidensity")}. Case insensitive, so "ReGuLaR" works. 
+#' @param num_bins For hexagonal binning when mode='overplot_adjust'. Number of bins across the X axis.
+#' @param contour_pct_outside Used in UMI density mode. This number (an integer in [1, 100]) specifies
+#' the tightness of the contour drawn on the plot -- how many cells are allowed to fall outside it?
+#' @param contour_params Used in UMI density mode. This list of parameters is
+#' passed to geom_path for drawing the outline around the cells.
+#' @param ... Passed into functions that preprocess before plotting. Currently only used 
+#' in mode 'umidensity' as extra params for the 2D KDE function 'ggtern::kde2d.weighted'.
+#' 
+#' @export
+#'
+custom_feature_plot = function(dge, 
+                               colour = NULL,
+                               subset_id = NULL,
+                               axes = c("tSNE_1", "tSNE_2"), 
+                               fix_coords = T, 
+                               show_axes = F,
+                               alpha = 1, 
+                               size.use = NULL, 
+                               cols.use = c("khaki1", "red"), 
+                               use_rank = F,
+                               overplot_adjust = F, 
+                               mode = "regular",
+                               num_bins = 50,
+                               contour_pct_outside = 5,
+                               contour_params = list( "col" = "grey", 
+                                                      "linetype" = "dashed" ), 
+                               ... ){
+  
+  # # Parse user input about plotting mode.
+  mode %<>% tolower
+  valid_modes = c("regular", "points", "overplot_adjust", "umi_density", "umidensity")
+  if( !mode %in% valid_modes ){
+    vm_pasted = paste0( valid_modes, collapse = " ; ")
+    warning(  paste0( "mode should be one of these: ", vm_pasted, " . Defaulting to regular.\n" ) )
+  }
+  if( mode %in% c("umi_density", "umidensity") ){
+    if(!requireNamespace("ggtern", quietly = T)){
+      stop("The ggtern package must be installed to make UMI density plots.\n")
+    }
+    if(!requireNamespace("ks", quietly = T)){
+      stop("The ks package must be installed to make UMI density plots.\n")
+    }
+    assertthat::assert_that(contour_pct_outside %in% 1:100)
+  }
+  if( overplot_adjust ){
+    warning( "overplot_adjust is deprecated. Instead, set mode='overplot_adjust' .\n")
+  }
+  
+  # Remove NA's. They otherwise cause a nasty bug that I haven't pinned down.
+  dge %<>% FillNA
+  
+  # Sanitize input -- `aes_string` may choke on genes with hyphens (e.g. Nkx2-1)
+  rownames( dge@data ) = make.names( rownames( dge@data ) )
+  rownames( dge@raw.data ) = make.names( rownames( dge@raw.data ) )
+  rownames( dge@scale.data ) = make.names( rownames( dge@scale.data ) )
+  colour = make.names( colour )
+  axes = make.names( axes )
+  my_df = FetchDataZeroPad(dge, vars.all = c(axes, colour, "ident" ), use.raw = F)
+  my_df = my_df[sample(nrow(my_df)), ]
+  
+  # # Omit some cells if user wants to omit them
+  # # but keep the plotting window the same.
+  if( !is.null( subset_id ) ){
+    cells.use = as.character(my_df$ident) %in% as.character(subset_id)
+  } else {
+    cells.use = rownames(my_df)
+  }
+  p = ggplot() + geom_blank( aes_string( x = axes[1], y = axes[2] ), data = my_df )
+  my_df = my_df[cells.use, ]
+  
+  # # Set default point size
+  if(is.null(size.use)){
+    size.use = 4 / log10( length( cells.use ) )
+    if( mode == "overplot_adjust" ){
+      size.use = 150 / num_bins
+    }
+  }
+  
+  # # Is the input a categorical variable?
+  is_categorical = (length(colour) > 0) && ( is.factor(my_df[[colour]]) | is.character(my_df[[colour]]) )
+  if( is_categorical & !is.element( mode, c( "regular", "points" ) ) ){
+    warning("categorical data can only be plotted as regular points. 
+            Continuing with mode=regular .\n" )
+    mode = "regular"
+  }
+  
+  # # Treat categorical variables one way and continuous one another way.
+  # # For categorical, assign randomly-ordered diverging colors if none given or not enough given
+  # # Convert to hexadecimal if any given as e.g. "red"
+  if( is_categorical ){
+    is_default = ( length( cols.use ) == length( blue_gray_red ) ) && all( cols.use == blue_gray_red )
+    if( is_default || length( cols.use ) < length( unique( my_df[[colour]] ) ) ){
+      better_rainbow = scales::hue_pal()
+      cols.use = ( my_df[[colour]] %>% unique %>% length %>% better_rainbow )
+    } else if ( any( cols.use %in% colors() ) ){
+      preserved_names = names(cols.use)
+      cols.use = gplots::col2hex( cols.use )
+      names(cols.use) = preserved_names
+    }
+    p = p + scale_color_manual(values = cols.use)    + scale_fill_manual(values = cols.use)
+  } else { 
+    if( (length( colour ) > 0) ){
+      # Optional rank transformation
+      if( use_rank ){
+        my_df[[colour]] = rank(my_df[[colour]]) 
+        p = p + labs(colour="Cell rank")
+      } else {
+        if( colour %in% rownames(dge@data) ){
+          p = p + labs(colour="Log \nnormalized \nexpression")
+        } else {
+          p = p + labs(colour=colour)
+        }
+      }
+      # Set color scale by individual points, even if aggregating as in overplot_adjust
+      #my_limits = c(min(my_df[[colour]]), max(my_df[[colour]]))
+      p = p + 
+        scale_color_gradientn(colors = cols.use )#, limits=my_limits) + 
+        scale_fill_gradientn (colors = cols.use ) 
+    }
+    p = p + xlab( axes[1] ) + ylab( axes[2] ) 
+  }
+  
+  if( is.element(mode, c("regular", "points")) ){
+    if( length( colour ) == 0 ){
+      p = p + geom_point( aes_string(x = axes[1], y = axes[2]), colour = "grey25",
+                          alpha = alpha, data = my_df,
+                          size = size.use )  
+    } else {
+      p = p + geom_point(aes_string(x = axes[1], y = axes[2], colour = colour), 
+                         alpha = alpha, data = my_df,
+                         size = size.use ) 
+      p = p + ggtitle( colour )
+    }
+  } else if( is.element(mode, c("overplot_adjust") ) ){
+    if( length( colour ) == 0 ){
+      p = p + geom_hex( aes_string( x = axes[1], y = axes[2], alpha = "..count..",  ), fill = "grey25",
+                        data = my_df, bins = num_bins )  
+    } else {
+      hex_data = hexbin::hexbin(my_df, xbins = num_bins )
+      hex_data = data.frame( x = hex_data@xcm, 
+                             y = hex_data@ycm, 
+                             count = hex_data@count )
+      names(hex_data)[1:2] = axes
+      nearest_bin = FNN::get.knnx( query = my_df[axes], 
+                                   data = hex_data[axes], 
+                                   k = 1, algorithm = "cover_tree" )$nn.index %>% c
+      bin_averages = aggregate_nice( my_df[[colour]], by = nearest_bin, FUN = mean )[, 1]
+      hex_data[names(bin_averages), colour] = bin_averages
+      p = p + geom_point( aes_string(x = axes[1], y = axes[2], size = "count", colour = colour ),
+                          data = hex_data )
+      p = p + scale_size(range = c(0, size.use))
+      p = p + ggtitle( colour )
+    }
+  } else if( is.element(mode, c("umi_density", "umidensity") ) ){
+    wkde = function( ..., n = 100 ) {
+      ggtern::kde2d.weighted( ..., n = n )
+    }
+    mylim = c( grDevices::extendrange(my_df[[axes[1]]], f = 0.2 ), 
+               grDevices::extendrange(my_df[[axes[2]]], f = 0.2 ) )
+    
+    if( length( colour ) == 0 ){
+      smoother = wkde(x = my_df[[axes[1]]], 
+                      y = my_df[[axes[2]]], 
+                      w = rep(1, nrow(my_df)), 
+                      lims = mylim, 
+                      ... )
+      colour = "cell_density"
+    } else {
+      smoother = wkde( x = my_df[[axes[1]]], 
+                       y = my_df[[axes[2]]], 
+                       w = my_df[[colour]], 
+                       lims = mylim, 
+                       ... )
+    }
+    p = p + ggtitle( colour ) 
+    smoother_long = expand.grid(smoother$x, smoother$y)
+    smoother_long_idx = expand.grid(seq_along(smoother$x), seq_along(smoother$y))
+    smoother_long$z = smoother$z[as.matrix(smoother_long_idx)]
+    names(smoother_long) = c(axes, colour)
+    p = p + geom_tile( data = smoother_long, 
+                       aes_string( x=axes[1], 
+                                   y=axes[2], 
+                                   fill = colour) )
+    p = p + geom_point( aes_string(x = axes[1], y = axes[2], alpha = colour),
+                        data = my_df,
+                        size = 1 )  
+    ### Draw outlines
+    kd <- ks::kde(my_df[axes], compute.cont=TRUE)
+    outline <- contourLines(x=kd$eval.points[[1]],
+                            y=kd$eval.points[[2]],
+                            z=kd$estimate,
+                            levels=kd$cont[paste0( contour_pct_outside, "%" )] )
+    for( ii in seq_along(outline)){
+      p = p + do.call( geom_path, 
+                       args = list( "mapping" = aes( x, y ), 
+                                    "data" = data.frame(outline[[ii]]) ) %>%
+                         c(contour_params) 
+      )
+    }
+  } else {
+    stop("Shouldn't reach here. Please tell Eric there was a 'mode' issue in custom_feature_plot. \n")
+  }
+  
+  if( fix_coords ){
+    p = p + coord_fixed() 
+    p = p + theme(
+      axis.line=element_blank(),
+      axis.ticks=element_blank(),
+      axis.text.x=element_blank(),
+      axis.text.y=element_blank(),
+      axis.title.x=element_blank(),
+      axis.title.y=element_blank(),
+      panel.border = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      strip.background = element_blank(), 
+      panel.background = element_rect(fill = "white",colour = NA), 
+      legend.key = element_rect(fill = "white", colour = NA) 
+    )
+  } else {
+    p = p + theme(
+      panel.border = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      strip.background = element_blank(), 
+      panel.background = element_rect(fill = "white",colour = NA), 
+      legend.key = element_rect(fill = "white", colour = NA) 
+    )
+  }
+  return(p)
+}
+```
+
+##### Featureplots in grids
+
+```{r}
+# Many thanks to the R cookbook for this function
+# http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_(ggplot2)/ 
+#
+# Multiple plot function
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    nrow = cols, ncol = ceiling(numPlots/cols)) %>% t
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+
+#' Save a rectangular grid of featureplots. 
+#'
+#' @param dge Seurat object.
+#' @param results_path Where to put the PDF. 
+#' @param gene_list What genes (features) to include. 
+#' @param gene_list_name Becomes name of plot. 
+#' @param ncol How wide is the grid (in panels)?
+#' @param width How wide is the grid (in inches)?
+#' @param height How tall is the grid (inches)?
+#' @param memory_saver Delete scale data of input to free memory and speed things up? 
+#' @param leg_pos,title_pos Element positions within the plot. Length 2 character vector with entries between 0 and 1.
+#' @param edit_fun This function is applied to every plot to put on the finishing touches.
+#'
+#' @export 
+#'
+SavePlotGrid = function( dge, results_path, 
+                           gene_list, gene_list_name, 
+                           ncol, width, height, 
+                           memory_saver = T, use_raw = F,
+                           leg_pos   = c(0.9, 0.9),
+                           title_pos = c(0.5, 0.9),
+                           edit_fun = (function(p) return(p)),
+                           ... ) {
+  fix_legend = function(p) {
+    p = p + labs(colour = "Log2 norm\nexpression")
+    p = p + theme(title           = element_text(hjust = title_pos[[1]], vjust = title_pos[[2]]))
+    p = p + theme(legend.position = c(                     leg_pos[[1]],           leg_pos[[2]]))
+    p = p + theme(legend.title = element_text(hjust = 0.95))
+    return(p)
+  }
+
+  if( memory_saver){
+    dge@scale.data = matrix()
+    if(use_raw){
+      dge@data = matrix()
+    } else {
+      dge@raw.data = matrix()
+    }
+    gc()
+  }
+  {
+    pdf(file.path(results_path, paste0(gene_list_name, ".pdf")), width = width, height = height )
+    multiplot( plotlist = lapply(gene_list, custom_feature_plot, dge = dge, ...) %>%
+                 lapply(fix_legend) %>% lapply(edit_fun), cols = ncol )
+    dev.off()
+  }
+}
+
+save_plot_grid = function( ... ){
+  warning("save_plot_grid is deprecated. Use SavePlotGrid instead.\n")
+  SavePlotGrid( ... )
+}
+```
+
+
+```{r}
+#' Save a plot from `custom_feature_plot`.
+#'
+#' @param dge Seurat object
+#' @param results_path Where to save files.
+#' @param colour A gene or type of metadata. Numeric zeroes plotted if `!is.element( colour, AvailableData( dge ) )`.
+#' @param fig_name Figure gets named <fig_name>.pdf or <fig_name>.png or similar. If you put a name ending in ".png" or ".pdf", the extension is stripped off.
+#' @param axes Character vector of length 2. Name of numeric variables available from `FetchData`.
+#' @param axes_description Character. Used in file paths, so no spaces please.
+#' @param alpha Numeric of length 1 between 0 and 1. Point transparency.
+#' @param height Passed to ggsave.
+#' @param width Passed to ggsave, but when you ask for a legend, it gets stretched a bit to make up for lost horizontal space.
+#' @param types Atomic character vector; can be longer than 1 element. If contains "PDF", you get a PDF back. If "PDF_no_leg", you get a PDF with no legend. If "PNG_PDF_split", you get back the points and bare axes in a PNG, plus text-containing elements in a PDF with no points. By default, does all three. Matching is not case sensitive.
+#' @param ... Additional arguments passed to `custom_feature_plot`.
+#'
+#' @export
+SaveFeaturePlot = function(dge, results_path, colour = NULL, fig_name = NULL,
+                        axes = c("tSNE_1", "tSNE_2"), axes_description = "TSNE", 
+                        alpha = 1, height = 7, width = 8, 
+                        types = c("PDF" ), ... ){
+  # Free memory 
+  dge@raw.data   = matrix()
+  dge@scale.data = matrix()
+  
+  # Sanitize input -- `aes_string` was choking on a gene with a hyphen (Nkx2-1)
+  rownames( dge@data ) = make.names( rownames( dge@data ) )
+  colour = make.names( colour )
+  axes == make.names( axes )
+  
+  # More input cleaning
+  types = tolower(types)
+  if( is.null( fig_name ) ){ fig_name = colour }
+  fig_name %<>% strip_suffix( ".pdf" )
+  fig_name %<>% strip_suffix( ".png" )
+  
+  # Get plot
+  p = custom_feature_plot(dge = dge, colour = colour, axes = axes, alpha = alpha, ... )
+  
+  # Save plots
+  dir.create.nice( file.path( results_path, axes_description ) )
+  if( "pdf" %in% types ){
+    ggsave( filename = file.path( results_path, axes_description, paste0(fig_name, ".pdf") ),
+            plot = p,
+            width = width, height = height)
+  } 
+  if( "png" %in% types ){
+    ggsave( filename = file.path( results_path, axes_description, paste0(fig_name, ".png") ),
+            plot = p,
+            width = width, height = height)
+  } 
+  if( any( c("pdf_noleg", "pdf_no_leg") %in% types ) ){
+    ggsave( filename = file.path( results_path, axes_description, paste0(fig_name, "_no_leg.pdf") ),
+            plot = p + theme(legend.position="none"),
+            width = width, height = height)
+  }
+  if( any( c( "png_pdf_split", "pdf_png_split" ) %in% types ) ){
+    # PNG no axis tick labels, no axis labels, and no legend
+    ggsave( filename = file.path( results_path, axes_description, paste0(fig_name, ".png") ),
+            plot = p + 
+              theme(legend.position="none") +
+              theme(axis.text.x  = element_blank(), 
+                    axis.text.y  = element_blank()) + 
+              xlab("") + ylab("") + ggtitle(""),
+            width = width, height = height)
+    
+    # ==== PDF with no points ====
+    # Copy plot and remove points
+    p_no_pts = p
+    p_no_pts$layers = p_no_pts$layers[1]
+    # Add two points to get the right color legend 
+    if(length(colour)!=0){
+      max_idx = which.max( FetchDataZeroPad(dge, colour)[[1]] )[1]
+      min_idx = which.min( FetchDataZeroPad(dge, colour)[[1]] )[1]
+      p_no_pts = p_no_pts + geom_point( data = FetchDataZeroPad( dge, c( axes, colour ) )[c( max_idx, min_idx ) , ],
+                                        aes_string( x = axes[[1]], y = axes[[2]], colour = colour ) )
+    }
+    ggsave( filename = file.path( results_path, axes_description, paste0(fig_name, "_no_pts.pdf") ),
+            plot = p_no_pts ,
+            width = width, height = height)
+  }
+}
+
+
+#' Save a featureplot to a file (deprecated)
+#'
+#' @export
+#'
+tsne_colored = function( ... ){
+  warning("tsne_colored is deprecated. Use SaveFeaturePlot instead.\n")
+  SaveFeaturePlot(...)
+}
+
+
+
+#' Annotate a plot with cluster labels
+#'
+#' @param dge Seurat object
+#' @param figname Name of the resulting file.
+#' @param results_path Where to put the resulting plot (directory). If NULL, no plot is saved.
+#' @param ident.use What clusters to plot.
+#' @param height @param width Passed to ggsave.
+#' @param axes @param ... Passed to custom_feature_plot. Axes are also used to position labels directly over clusters. 
+#' @export
+#'
+annot_ident_plot = function(dge, 
+                            results_path = NULL, 
+                            ident.use = "ident",
+                            figname = ident.use,
+                            height = 20, width = 20,
+                            axes = c("tSNE_1", "tSNE_2"),  ... ){
+  centers = aggregate_nice( FetchData(dge, axes), by=FetchData(dge, ident.use), mean ) %>% as.data.frame
+  centers$cluster = rownames(centers)
+  p = custom_feature_plot( dge, colour = ident.use, axes = axes, ... )
+  if( requireNamespace("ggrepel")){
+    gl = ggrepel::geom_label_repel
+  } else {
+    gl = ggplot2::geom_label
+  }
+  p = p + gl( data = centers, aes_string(x = axes[[1]], y = axes[[2]], label = "cluster", size = 8 ) )
+  p = p + theme(legend.position = "none")
+  if( !is.null( results_path ) ){
+    ggsave(file.path(results_path, paste0(figname, ".pdf")), p, height = height, width = width)
+  }
+  return(p)
+}
+```
+
+```{r}
+#' Save commonly needed summary plots: plain gray, eday, clusters, replicates, nUMI, nGene, and pseudotime if available.
+#'
+#' @export
+misc_summary_info = function(dge, results_path, clusters_with_names = NULL,
+                             axes = c("tSNE_1", "tSNE_2"), axes_description = "TSNE", alpha = 1 ){
+  results_path = file.path( results_path, "summaries" )
+  
+  # # Plot summary, checking automatically whether the colour variable is available
+  try_to_plot = function( fig_name, colour, ... ){
+    if( length( colour ) == 0 || colour %in% AvailableData(dge) ){
+      tsne_colored( dge = dge, results_path,
+                    fig_name = fig_name, colour = colour, 
+                    axes = axes, axes_description = axes_description, alpha = alpha, ...)
+    } else {
+      print( paste0( "Skipping summary of ", colour, " because it's not available." ) )
+    }
+  }
+  
+  try_to_plot( "plain_gray.pdf", colour = NULL )
+  try_to_plot( "replicates.pdf", "rep" )
+  try_to_plot( "cell_type.pdf" , "cell_type" )
+  try_to_plot( "clusters.pdf"  , "ident" )
+  try_to_plot( "classifier.pdf", "classifier_ident" )
+  try_to_plot( "samples.pdf"   , "orig.ident" )
+  try_to_plot( "nGenes.pdf"    , "nGenes" )
+  try_to_plot( "nUMI.pdf"      , "nUMI" )
+  try_to_plot( "branch.pdf"    , "branch" )
+  try_to_plot( "pseudotime.pdf", "pseudotime" )
+  try_to_plot( "day.pdf"       , "eday" )
+  try_to_plot( "edayXgenotype.pdf"   , "edayXgenotype" )
+
+  if( all( c("pseudotime", "eday") %in% AvailableData( dge ) ) ) {
+    ggsave( filename = file.path( results_path, "pseudotime_by_eday_box.pdf"),
+            plot = ggplot( FetchData( dge, c( "pseudotime", "eday" ) ), 
+                           aes( y = pseudotime, x = factor( eday ) ) ) + geom_boxplot() )
+  }
+}
+
+
+#' Save plots en masse.
+#'
+#' @param dge Seurat object with available tSNE coords (or whatever is in `axes`) 
+#' @param results_path: where to save the resulting plots
+#' @param gene_list: character vector consisting of gene names
+#' @param gene_list_name: used in file paths so that you can call this function again with different `gene_list_name`
+#    but the same results_path and it won't overwrite.
+#' @param axes: any pair of numeric variables retrievable via FetchData. Defaults to `c("tSNE_1", "tSNE_2")`.
+#' @param axes_description: used in file paths so that you can call this function again with different `axes_description` but the same `results_path` and it won't overwrite.
+#' @param time_series: Uses `time_series` internally instead of `custom_feature_plot`. Changes defaults for
+#' `axes` and `axes_description`.
+#' @param alpha Transparency of points
+#' @param ... Additional parameters are passed to `custom_feature_plot` or `time_series`
+#' @export
+save_feature_plots = function( dge, results_path, 
+                               gene_list = NULL, 
+                               gene_list_name = NULL, 
+                               axes = NULL,
+                               axes_description = NULL,
+                               do_time_series = F,
+                               alpha = 1,   
+                               ... ){
+  # # Adjust defaults sensibly
+  if( do_time_series ){
+    if( is.null( axes            ) )  { 
+      axes             = "pseudotime"
+      axes_description = "pseudotime"
+    }
+  } else {
+    if( is.null( axes             ) ) { 
+      axes = c( "tSNE_1", "tSNE_2" ) 
+      axes_description = "TSNE" 
+    }
+  }
+  if( is.null( axes_description ) ){
+    axes_description = deparse( substitute( axes ) )
+  }
+  
+  # # Defaults to rene's markers if gene_list not given
+  # # If gene_list is not given, gene_list_name is replaced with "rene_picks"
+  # # gene_list_name defaults to "unknown" if only gene_list_name not given
+  if( is.null( gene_list ) ){
+    gene_list = get_rene_markers()$marker %>% harmonize_species(dge)
+    if( !is.null( gene_list_name ) ){
+      warning("Overwriting gene_list_name argument with 'rene_picks' since gene_list was not given.")
+    }
+    gene_list_name = "rene_picks"
+  } else if(is.null(gene_list_name)){
+    warning("Please fill in the gene_list_name argument. Defaulting to 'unknown'.")
+    gene_list_name = "unknown"
+  }
+  
+  no_data = c()
+  feature_plots_path = file.path(results_path, "feature_plots", gene_list_name)
+  dir.create.nice( feature_plots_path )
+  dir.create.nice( file.path( feature_plots_path ) )
+   
+  gene_list = as.character( gene_list )
+  dge@scale.data = matrix()
+  dge@raw.data = matrix()
+  gc()
+  
+  for( gene_name in gene_list ){
+    if( !do_time_series ){
+      SaveFeaturePlot( dge, results_path = feature_plots_path, colour = gene_name, 
+                       axes = axes, axes_description = axes_description, alpha = alpha, ... )
+    } else {
+      time_series_save( dge, results_path = feature_plots_path, gene = gene_name, ... )
+    }
+  } 
+  cat( "Plots saved to", file.path( feature_plots_path ), "\n" )
+}
+
+```
+
+Pie charts
+
+```{r}
+#' Make small-multiple pie charts.
+#'
+#' @param dge Seurat object
+#' @param ident.use Becomes the categories in the pie chart
+#' @param facet_by Each small multiple contains cases at one level of this variable.
+#' @param col Optional colorscale.
+#' @param label Logical. If TRUE, percentages are added.
+#' @param main Plot title.
+#' @param drop_levels If TRUE, omit facets that would be empty. 
+#'
+#' @export
+#'
+SeuratPie = function( dge, ident.use = "cell_type", facet_by = "eday", col = NULL, label = F, main = "Sample makeup by day", drop_levels = F ){
+  #### Testing
+  # Test each cluster for a quadratic trend in pct by eday, weighted by the number of cells at each eday.
+  # Assemble percentages for testing
+  pct_for_testing = FetchData( dge, c( ident.use, "orig.ident" )) %>% 
+    table %>% 
+    apply(2, percentify) %>% 
+    (reshape2::melt) %>% 
+    plyr::rename(c("value" = "percent")) 
+  ncells =  FetchData( dge, "orig.ident" ) %>% table 
+  
+  # Fill in eday based on sample id
+  map_to_eday = setNames(get_metadata()$eday, 
+                         get_metadata()$Sample_ID %>% as.character ) 
+  
+  map_to_eday %<>% na.omit 
+  nm = names( map_to_eday )
+  map_to_eday %<>% as.numeric
+  names(map_to_eday) = nm
+  pct_for_testing$eday = map_to_eday[pct_for_testing$orig.ident %>% as.character] 
+  pct_for_testing$eday_sq = pct_for_testing$eday ^ 2
+  
+  # Quadratic fit, weighted by day, tested against null model
+  cell_types = unique(pct_for_testing[[ident.use]])
+  pvals = rep(1, length(cell_types))
+  names(pvals) = cell_types
+  for( cl in cell_types ){
+    this_cluster_data = subset( pct_for_testing, eval(parse(text = ident.use)) == cl )
+    mod = lm( data = this_cluster_data, formula = percent~eday + eday_sq, weights = ncells )
+    test_result = car::linearHypothesis(mod, c("eday = 0", "eday_sq = 0" ))
+    pvals[cl] = test_result$`Pr(>F)`[[2]]
+  }
+  
+  #### Plotting
+  # Get percentages by facet
+  X = FetchData( dge, c( ident.use, facet_by )) %>% 
+    table %>% 
+    apply(2, percentify) %>% 
+    (reshape2::melt) %>% 
+    plyr::rename(c("value" = "percent")) 
+  if( drop_levels ){
+    X %<>% subset( percent != 0 )
+  }
+  facet_values = FetchData( dge, facet_by )[[1]]
+  if(is.factor(facet_values) & !drop_levels){
+    X[[facet_by]] %<>% factor(levels = levels(facet_values), ordered = T)
+  } 
+  
+  # Position percentages decently
+  X$at = 0
+  X = X[order(X[[ident.use]]), ]
+  for(facet_level in unique(X[[facet_by]])){
+    idx = (X[[facet_by]] == facet_level)
+    X[idx, "at"] = 100 - ( cumsum(X[idx, "percent"]) - X[idx, "percent"]/2 )
+  }
+  
+  # Pie charts require stat=identity and x=constant
+  p = ggplot(X) + ggtitle( main) + 
+    geom_bar( aes_string( y = "percent", x = "factor('')", fill = ident.use ), position = "stack", stat='identity' ) + 
+    coord_polar(theta = "y") + xlab("") + ylab("") + 
+    facet_wrap(facet_by, nrow = 1) + theme(axis.ticks = element_blank(), 
+                                           axis.text.y = element_blank(),
+                                           axis.text.x = element_blank()) 
+  if(!is.null(col)){p = p + scale_fill_manual( values = col ) }
+  if( label ) { p = p + geom_text( aes( y = at, x = 1.5, label = percent ) ) }
+  p = p + 
+    scale_fill_manual( name="Cell type (Log10 p)",
+                       values = col, 
+                       breaks=cell_types,
+                       labels=paste0(cell_types, " (", round(log10(pvals), 1), ")"))
+  
+  return(p)
+} 
+```
